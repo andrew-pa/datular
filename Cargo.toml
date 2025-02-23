@@ -1,0 +1,14 @@
+[package]
+name = "datular"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+snafu = "0.8"
+tokio = { version = "1.43", features = ["full"]}
+tower-http = { version = "0.6", features = ["trace", "metrics"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = [] }
