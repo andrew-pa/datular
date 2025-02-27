@@ -1,22 +1,16 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Router,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, put},
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use snafu::{OptionExt, ResultExt, Snafu, Whatever};
-use tokio::{
-    fs::File,
-    io::AsyncWriteExt as _,
-    sync::{Mutex, RwLock},
-};
+use snafu::{ResultExt, Snafu, Whatever};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -30,70 +24,11 @@ pub enum Error {
     NotFound,
 }
 
-#[derive(Serialize)]
-pub struct LogRecord<'k, 'v> {
-    #[serde(borrow)]
-    key: &'k str,
-    #[serde(borrow)]
-    value: &'v Value,
-}
+pub mod sstable;
+pub mod store;
+pub mod wal;
 
-pub struct DataStore {
-    write_log: Mutex<File>,
-    in_memory: RwLock<BTreeMap<String, Value>>,
-}
-
-impl DataStore {
-    pub async fn new(log_path: impl AsRef<std::path::Path>) -> Result<Self, Whatever> {
-        Ok(Self {
-            write_log: Mutex::new(
-                File::options()
-                    .append(true)
-                    .create(true)
-                    .write(true)
-                    .open(log_path)
-                    .await
-                    .whatever_context("open write log file")?,
-            ),
-            in_memory: RwLock::default(),
-        })
-    }
-
-    pub async fn get(&self, key: &str) -> Result<Value, Error> {
-        debug!(key, "get");
-        self.in_memory
-            .read()
-            .await
-            .get(key)
-            .inspect(|value| trace!(%value, "got"))
-            .context(NotFoundSnafu)
-            .cloned()
-    }
-
-    pub async fn put(&self, key: String, value: Value) -> Result<(), Error> {
-        debug!(key, %value, "put");
-        let record = LogRecord {
-            key: &key,
-            value: &value,
-        };
-        let mut record_bytes = serde_json::to_vec(&record).context(SerializeSnafu)?;
-        record_bytes.push(b'\n');
-        trace!("writing to log");
-        self.write_log
-            .lock()
-            .await
-            .write_all(&record_bytes)
-            .await
-            .context(IoSnafu {
-                cause: "write to write log",
-            })?;
-
-        trace!("inserting value into in-memory store");
-        self.in_memory.write().await.insert(key, value);
-
-        Ok(())
-    }
-}
+use store::DataStore;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -110,27 +45,24 @@ impl IntoResponse for Error {
     }
 }
 
-#[tracing::instrument(skip(data_store))]
-async fn get_value(
-    State(data_store): State<Arc<DataStore>>,
-    Path(key): Path<String>,
-) -> Result<Json<Value>, Error> {
-    data_store.get(&key).await.map(Json)
-}
-
-#[tracing::instrument(skip(value, data_store))]
-async fn put_value(
-    State(data_store): State<Arc<DataStore>>,
-    Path(key): Path<String>,
-    Json(value): Json<Value>,
-) -> Result<(), Error> {
-    data_store.put(key, value).await
-}
-
 fn data_router() -> Router<Arc<DataStore>> {
     Router::new()
-        .route("/{key}", get(get_value))
-        .route("/{key}", put(put_value))
+        .route(
+            "/{key}",
+            get(
+                async |State(data_store): State<Arc<DataStore>>, Path(key): Path<String>| {
+                    data_store.get(&key).await
+                },
+            ),
+        )
+        .route(
+            "/{key}",
+            put(
+                async |State(data_store): State<Arc<DataStore>>,
+                       Path(key): Path<String>,
+                       value: Bytes| { data_store.put(key, value).await },
+            ),
+        )
 }
 
 #[tokio::main]
@@ -140,7 +72,7 @@ async fn main() -> Result<(), Whatever> {
     info!("Hello, world!");
 
     let data_store = Arc::new(
-        DataStore::new("/tmp/write-log")
+        DataStore::new("/tmp/datular".into())
             .await
             .whatever_context("initalize data store")?,
     );
