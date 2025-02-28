@@ -1,37 +1,57 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use axum::body::Bytes;
+use futures::{StreamExt as _, TryStreamExt};
 use snafu::{ResultExt, Whatever};
 use tokio::{
     fs::{self, File},
-    sync::{RwLock, RwLockWriteGuard},
+    io::BufWriter,
+    sync::{Mutex, RwLock, RwLockWriteGuard},
 };
 
+use tokio_stream::wrappers::ReadDirStream;
 use tracing::{debug, error, info, trace};
 
-use crate::sstable::InMemoryTable;
+use crate::sstable::{InMemoryTable, OnDiskTable};
 use crate::{
     Error, IoSnafu,
-    wal::{LogRecord, WriteLogFile},
+    wal::{LogRecord, WriteAheadLog},
 };
 
 pub struct DataStore {
     sstable_dir: PathBuf,
-    in_memory: RwLock<(WriteLogFile, InMemoryTable)>,
+    sstable_index: RwLock<Vec<usize>>,
+    in_memory: RwLock<(WriteAheadLog, InMemoryTable)>,
 }
 
 impl DataStore {
-    pub async fn new(data_path: PathBuf) -> Result<Self, Whatever> {
+    pub async fn new(data_path: &Path) -> Result<Self, Whatever> {
         let log_path = data_path.join("log");
         let sst_path = data_path.join("data");
-        info!(log_path=?log_path.display(), data_path=?sst_path.display(), "initializing data store");
-        let write_log = WriteLogFile::new(log_path).await?;
+        info!(log_path=%log_path.display(), data_path=%sst_path.display(), "initializing data store");
+
+        let write_log_and_init_recovered_table = WriteAheadLog::open(log_path).await?;
+
         fs::create_dir_all(&sst_path)
             .await
             .whatever_context("create data directory")?;
+
+        let sstables_on_disk = ReadDirStream::new(
+            fs::read_dir(&sst_path)
+                .await
+                .whatever_context("open sstable directory")?,
+        );
+        let mut tables: Vec<usize> = sstables_on_disk
+            .try_filter_map(async |e| Ok(e.file_name().to_string_lossy().parse::<usize>().ok()))
+            .try_collect()
+            .await
+            .whatever_context("scan sstable directory")?;
+        tables.sort();
+
         Ok(Self {
             sstable_dir: sst_path,
-            in_memory: RwLock::new((write_log, InMemoryTable::default())),
+            sstable_index: RwLock::new(tables),
+            in_memory: RwLock::new(write_log_and_init_recovered_table),
         })
     }
 
@@ -39,28 +59,37 @@ impl DataStore {
     pub async fn get(&self, key: &str) -> Result<Bytes, Error> {
         debug!(key, "get");
         if let Some(value) = self.in_memory.read().await.1.get(key) {
-            trace!(?value, "got");
+            debug!(?value, "got");
             Ok(value.clone())
         } else {
+            let tables = self.sstable_index.read().await;
+            for table_index in tables.iter().rev() {
+                let path = self.sstable_dir.join(table_index.to_string());
+                let mut table = OnDiskTable::open(&path).await?;
+                if let Some(v) = table.get(key).await? {
+                    debug!(value=?v, "got value from disk");
+                    return Ok(v);
+                }
+            }
             Err(Error::NotFound)
         }
     }
 
     async fn flush_in_memory(
         &self,
-        in_mem: &mut RwLockWriteGuard<'_, (WriteLogFile, InMemoryTable)>,
+        in_mem: &mut RwLockWriteGuard<'_, (WriteAheadLog, InMemoryTable)>,
     ) -> Result<(), Error> {
         let old_log_segment_id = in_mem.0.rotate_log().await?;
-        trace!(segment_id = old_log_segment_id, "flushing in-memory store");
+        debug!(segment_id = old_log_segment_id, "flushing in-memory store");
 
         let data = core::mem::take(&mut in_mem.1);
 
         let path = self.sstable_dir.join(old_log_segment_id.to_string());
 
-        debug!(path=%path.display(), "creating new SSTable file");
-        let mut f = File::create_new(path).await.context(IoSnafu {
+        trace!(path=%path.display(), "creating new SSTable file");
+        let mut f = BufWriter::new(File::create_new(path).await.context(IoSnafu {
             cause: "create SSTable file",
-        })?;
+        })?);
 
         match data.write(&mut f).await {
             Ok(()) => {
@@ -75,6 +104,8 @@ impl DataStore {
                 panic!("what is the right thing to do here?");
             }
         }
+
+        self.sstable_index.write().await.push(old_log_segment_id);
 
         match in_mem.0.delete_old_segment(old_log_segment_id).await {
             Ok(()) => {}
@@ -91,17 +122,13 @@ impl DataStore {
     #[tracing::instrument(skip_all)]
     pub async fn put(&self, key: String, value: Bytes) -> Result<(), Error> {
         debug!(key, ?value, "put");
-        let record = LogRecord {
-            key: &key,
-            value: &value,
-        };
         let mut in_mem = self.in_memory.write().await;
 
         if in_mem.1.needs_flush() {
             self.flush_in_memory(&mut in_mem).await?;
         }
 
-        in_mem.0.log_write(record).await?;
+        in_mem.0.log_write(&key, &value).await?;
 
         trace!("inserting value into in-memory store");
         in_mem.1.insert(key, value);

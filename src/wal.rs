@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use axum::body::Bytes;
 use futures::TryStreamExt as _;
 use serde::Serialize;
 use snafu::{ResultExt as _, Whatever};
@@ -10,7 +11,11 @@ use tokio::{
 use tokio_stream::wrappers::ReadDirStream;
 use tracing::{trace, warn};
 
-use crate::{Error, IoSnafu, SerializeSnafu};
+use crate::{
+    Error, IoSnafu, SerializeSnafu,
+    kv::{read_next_key_value, write_key_value},
+    sstable::InMemoryTable,
+};
 
 #[derive(Serialize)]
 pub struct LogRecord<'k, 'v> {
@@ -20,7 +25,7 @@ pub struct LogRecord<'k, 'v> {
     pub value: &'v [u8],
 }
 
-pub struct WriteLogFile {
+pub struct WriteAheadLog {
     log_dir: PathBuf,
     current_segment: File,
     current_segment_id: usize,
@@ -38,8 +43,8 @@ async fn open_segment_file(
         .await
 }
 
-impl WriteLogFile {
-    pub async fn new(log_dir_path: impl Into<PathBuf>) -> Result<Self, Whatever> {
+impl WriteAheadLog {
+    pub async fn open(log_dir_path: impl Into<PathBuf>) -> Result<(Self, InMemoryTable), Whatever> {
         let log_dir = log_dir_path.into();
         fs::create_dir_all(&log_dir)
             .await
@@ -49,38 +54,55 @@ impl WriteLogFile {
                 .await
                 .whatever_context("open log directory")?,
         );
-        let current_segment_id = log_dir_s
-            .try_fold(0, |acc, entry| {
-                match entry.file_name().to_string_lossy().parse() {
-                    Ok(id) => futures::future::ok(acc.max(id)),
+        let mut log_segments: Vec<(usize, Vec<(String, Bytes)>)> = log_dir_s
+            .try_filter_map(
+                async |entry| match entry.file_name().to_string_lossy().parse() {
+                    Ok(id) => {
+                        let mut table = Vec::new();
+                        let mut f = File::open(entry.path()).await?;
+                        while let Some(kv) = read_next_key_value(&mut f).await? {
+                            table.push(kv);
+                        }
+                        Ok(Some((id, table)))
+                    }
                     Err(e) => {
                         warn!(?entry, "found unusual file in log directory: {e}");
-                        futures::future::ok(acc)
+                        Ok(None)
                     }
-                }
-            })
+                },
+            )
+            .try_collect()
             .await
-            .whatever_context("find current segment id")?;
-        trace!(current_segment_id);
+            .whatever_context("read old log")?;
+        log_segments.sort_by_key(|(i, _)| *i);
+        let current_segment_id = log_segments.last().map(|(i, _)| *i).unwrap_or_default();
+        let recovered_table =
+            log_segments
+                .into_iter()
+                .fold(InMemoryTable::default(), |mut rt, (_, table)| {
+                    rt.extend_with(table);
+                    rt
+                });
+        trace!(current_segment_id, recovered_values = recovered_table.len());
         let current_segment = open_segment_file(&log_dir, current_segment_id)
             .await
             .whatever_context("open write log file")?;
-        Ok(Self {
-            log_dir,
-            current_segment,
-            current_segment_id,
-        })
+        Ok((
+            Self {
+                log_dir,
+                current_segment,
+                current_segment_id,
+            },
+            recovered_table,
+        ))
     }
 
-    pub async fn log_write(&mut self, record: LogRecord<'_, '_>) -> Result<(), Error> {
-        let mut record_bytes = serde_json::to_vec(&record).context(SerializeSnafu)?;
-        record_bytes.push(b'\n');
+    pub async fn log_write(&mut self, key: &str, value: &Bytes) -> Result<(), Error> {
         trace!("writing to log");
-        self.current_segment
-            .write_all(&record_bytes)
+        write_key_value(&mut self.current_segment, key, value)
             .await
             .context(IoSnafu {
-                cause: "write to write log",
+                cause: "write key/value pair to log",
             })?;
         self.current_segment.sync_data().await.context(IoSnafu {
             cause: "sync write log",

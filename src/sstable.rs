@@ -1,30 +1,25 @@
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap, io::SeekFrom, mem::MaybeUninit, path::Path};
 
 use axum::body::Bytes;
 use bytemuck::{Pod, Zeroable};
 use fastbloom::BloomFilter;
-use snafu::ResultExt as _;
-use tokio::{fs::File, io::AsyncWriteExt as _};
+use snafu::{ResultExt as _, ensure};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _, BufReader},
+    sync::{Mutex, OnceCell},
+};
+use tracing::{debug, trace};
 
-use crate::{Error, IoSnafu};
+use crate::{CONFIG, Error, FileFormatVersionSnafu, IoSnafu, SerializeSnafu, kv::write_key_value};
 
-pub const MAX_IN_MEMORY_VALUES: usize = 1024;
 pub const BLOOM_FILTER_FALSE_POSITIVE_RATE: f64 = 0.01;
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
-struct KeyValueRef {
-    key_offset: u64,
-    value_offset: u64,
-    key_len: u32,
-    value_len: u32,
-}
-
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-#[repr(C)]
-struct SSTableFileHeader {
+struct FileHeader {
     version: u32,
-    key_filter_size: u32,
+    key_filter_len: u32,
     num_values: u64,
 }
 
@@ -37,7 +32,7 @@ impl Default for InMemoryTable {
     fn default() -> Self {
         Self {
             key_filter: BloomFilter::with_false_pos(BLOOM_FILTER_FALSE_POSITIVE_RATE)
-                .expected_items(MAX_IN_MEMORY_VALUES),
+                .expected_items(CONFIG.max_in_memory_values),
             data: BTreeMap::default(),
         }
     }
@@ -45,7 +40,7 @@ impl Default for InMemoryTable {
 
 impl InMemoryTable {
     pub fn get(&self, key: &str) -> Option<&Bytes> {
-        self.data.get(key)
+        self.data.get(key).filter(|v| !v.is_empty())
     }
 
     pub fn insert(&mut self, key: String, value: Bytes) {
@@ -53,36 +48,33 @@ impl InMemoryTable {
         self.data.insert(key, value);
     }
 
-    pub fn needs_flush(&self) -> bool {
-        self.data.len() >= MAX_IN_MEMORY_VALUES
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 
-    pub async fn write(&self, f: &mut File) -> Result<(), Error> {
+    pub fn needs_flush(&self) -> bool {
+        self.data.len() >= CONFIG.max_in_memory_values
+    }
+
+    pub fn extend_with(&mut self, items: Vec<(String, Bytes)>) {
+        for (k, _) in items.iter() {
+            self.key_filter.insert(k);
+        }
+        self.data.extend(items);
+    }
+
+    pub async fn write(&self, f: &mut (impl AsyncWrite + Unpin)) -> Result<(), Error> {
         // file format:
         // version, number of keys
         // bloom filter
-        // index: sorted tuples of (key offset, key len, value offset, value len)
-        // the keys in one blob
-        // the values in another blob
+        // sequence of: key len; value len; key bytes; value bytes
 
-        // build index & bloom filter
-        let mut slices = Vec::with_capacity(self.data.len() * std::mem::size_of::<KeyValueRef>());
-        let mut next_key_offset = 0;
-        let mut next_val_offset = 0;
-        for (k, v) in self.data.iter() {
-            slices.extend_from_slice(bytemuck::bytes_of(&KeyValueRef {
-                key_offset: next_key_offset,
-                value_offset: next_val_offset,
-                key_len: k.len() as u32,
-                value_len: v.len() as u32,
-            }));
-            next_key_offset += k.len() as u64;
-            next_val_offset += v.len() as u64;
-        }
-        let header = SSTableFileHeader {
+        let filter_ser = postcard::to_allocvec(&self.key_filter).context(SerializeSnafu)?;
+
+        let header = FileHeader {
             version: 0,
-            num_values: slices.len() as u64,
-            key_filter_size: self.key_filter.as_slice().len() as u32,
+            num_values: self.data.len() as u64,
+            key_filter_len: filter_ser.len() as u32,
         };
 
         f.write_all(bytemuck::bytes_of(&header))
@@ -90,27 +82,112 @@ impl InMemoryTable {
             .context(IoSnafu {
                 cause: "write SSTable header",
             })?;
-        f.write_all(bytemuck::cast_slice(self.key_filter.as_slice()))
-            .await
-            .context(IoSnafu {
-                cause: "write bloom filter for keys",
-            })?;
-        f.write_all(slices.as_slice()).await.context(IoSnafu {
-            cause: "write key/value slices",
+        f.write_all(&filter_ser).await.context(IoSnafu {
+            cause: "write bloom filter for keys",
         })?;
 
-        for k in self.data.keys() {
-            f.write_all(k.as_bytes())
-                .await
-                .context(IoSnafu { cause: "write key" })?;
-        }
-
-        for v in self.data.values() {
-            f.write_all(v).await.context(IoSnafu {
-                cause: "write value",
+        for (key, value) in self.data.iter() {
+            write_key_value(f, key, value).await.context(IoSnafu {
+                cause: "write key/value pair",
             })?;
         }
 
+        f.flush().await.context(IoSnafu {
+            cause: "flush stream",
+        })?;
+
         Ok(())
+    }
+}
+
+pub struct OnDiskTable {
+    file: BufReader<File>,
+    header: FileHeader,
+}
+
+impl OnDiskTable {
+    pub async fn open(path: &Path) -> Result<Self, Error> {
+        let mut file = BufReader::new(File::open(path).await.context(IoSnafu {
+            cause: "open sstable on disk",
+        })?);
+        let mut header = FileHeader::zeroed();
+        file.read_exact(bytemuck::bytes_of_mut(&mut header))
+            .await
+            .context(IoSnafu {
+                cause: "read sstable header",
+            })?;
+        ensure!(header.version == 0, FileFormatVersionSnafu);
+        debug!(?header, path=?path.display(), "opening on-disk SSTable");
+        Ok(Self { file, header })
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn get(&mut self, key: &str) -> Result<Option<Bytes>, Error> {
+        self.file
+            .seek(SeekFrom::Start(size_of::<FileHeader>() as u64))
+            .await
+            .context(IoSnafu {
+                cause: "seek to key filter",
+            })?;
+        let mut buf = vec![0; self.header.key_filter_len as usize];
+        self.file.read_exact(&mut buf).await.context(IoSnafu {
+            cause: "read key filter",
+        })?;
+        let key_filter: BloomFilter = postcard::from_bytes(&buf).context(SerializeSnafu)?;
+        trace!("checking key filter for key");
+        if !key_filter.contains(key) {
+            return Ok(None);
+        }
+
+        trace!("scanning for value");
+        for _ in 0..self.header.num_values {
+            // read the lengths of the key and value
+            let key_len = self.file.read_u32_le().await.context(IoSnafu {
+                cause: "read key len",
+            })?;
+            let val_len = self.file.read_u32_le().await.context(IoSnafu {
+                cause: "read value len",
+            })?;
+
+            // read the full key
+            let mut key_buf = vec![0u8; key_len as usize];
+            self.file
+                .read_exact(&mut key_buf)
+                .await
+                .context(IoSnafu { cause: "read key" })?;
+
+            // compare the key to the one we are looking for
+            match key_buf.as_slice().cmp(key.as_bytes()) {
+                Ordering::Less => {
+                    // keep going, skip this value
+                    self.file
+                        .seek(SeekFrom::Current(val_len as i64))
+                        .await
+                        .context(IoSnafu {
+                            cause: "skip value",
+                        })?;
+                    continue;
+                }
+                Ordering::Equal => {
+                    // we found the key
+                    if val_len > 0 {
+                        // there is a value, read/return it
+                        let mut val_buf = vec![0u8; val_len as usize];
+                        self.file.read_exact(&mut val_buf).await.context(IoSnafu {
+                            cause: "read value",
+                        })?;
+                        return Ok(Some(val_buf.into()));
+                    } else {
+                        // the value was deleted
+                        return Ok(None);
+                    }
+                }
+                // we've gotten past the point in the table where we expect to find the key, so we
+                // are finished searching
+                Ordering::Greater => return Ok(None),
+            }
+        }
+
+        Ok(None)
     }
 }
