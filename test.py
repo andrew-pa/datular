@@ -37,6 +37,7 @@ import subprocess
 import time
 import tempfile
 import shutil
+import random
 
 import pytest
 import requests
@@ -45,7 +46,8 @@ import requests
 # "0.0.0.0:3333", we connect via localhost.
 SERVICE_URL = "http://127.0.0.1:3333"
 
-enable_logging = True
+enable_logging = False
+
 
 def start_datastore(storage_dir, additional_env=None):
     """
@@ -72,11 +74,12 @@ def start_datastore(storage_dir, additional_env=None):
         stderr=subprocess.PIPE,
     )
 
-    # Wait for the service to be up by polling a non-existent key.
+    # Wait for the service to be up
     for _ in range(10):
         try:
-            r = requests.get(f"{SERVICE_URL}/d/nonexistent", timeout=1)
-            if r.status_code in (404, 200):
+            r = requests.get(f"{SERVICE_URL}/health", timeout=1)
+            r.raise_for_status()
+            if r.status_code == 200:
                 break
         except Exception:
             time.sleep(0.5)
@@ -84,6 +87,7 @@ def start_datastore(storage_dir, additional_env=None):
         proc.kill()
         pytest.skip("Datastore service did not start in time")
     return proc
+
 
 @pytest.fixture
 def datastore_instance():
@@ -101,16 +105,19 @@ def datastore_instance():
         proc.wait(timeout=5)
         shutil.rmtree(storage_dir)
 
+
 # ---------------------------------------------------------------------------
 # Helper functions to interact with the datastore HTTP API.
 # Each function takes a base URL (from the fixture) to allow flexibility.
 # ---------------------------------------------------------------------------
+
 
 def put_key_url(base_url, key, value):
     """Stores the given value at the specified key."""
     full_url = f"{base_url}/d/{key}"
     r = requests.put(full_url, data=value)
     r.raise_for_status()
+
 
 def get_key_url(base_url, key):
     """Retrieves the value stored at the specified key, or returns None if not found."""
@@ -121,6 +128,7 @@ def get_key_url(base_url, key):
     r.raise_for_status()
     return r.content
 
+
 def delete_key_url(base_url, key):
     """Deletes the key from the datastore. Ignores deletion of non-existent keys."""
     full_url = f"{base_url}/d/{key}"
@@ -128,9 +136,11 @@ def delete_key_url(base_url, key):
     if r.status_code not in (200, 204, 404):
         r.raise_for_status()
 
+
 # ---------------------------------------------------------------------------
 # Test Cases
 # ---------------------------------------------------------------------------
+
 
 def test_get_nonexistent(datastore_instance):
     """
@@ -138,6 +148,7 @@ def test_get_nonexistent(datastore_instance):
     """
     val = get_key_url(datastore_instance, "nonexistent")
     assert val is None
+
 
 def test_put_and_get(datastore_instance):
     """
@@ -148,6 +159,7 @@ def test_put_and_get(datastore_instance):
     put_key_url(datastore_instance, key, value)
     retrieved = get_key_url(datastore_instance, key)
     assert retrieved == value
+
 
 def test_delete(datastore_instance):
     """
@@ -163,11 +175,11 @@ def test_delete(datastore_instance):
     # Confirm deletion.
     assert get_key_url(datastore_instance, key) is None
 
-@pytest.mark.parametrize("label,size", [
-    ("small", 10),
-    ("medium", 1024),      # 1KB value
-    ("large", 1024 * 1024) # 1MB value
-])
+
+@pytest.mark.parametrize(
+    "label,size",
+    [("small", 10), ("medium", 1024), ("large", 1024 * 1024)],  # 1KB value  # 1MB value
+)
 def test_large_value(datastore_instance, label, size):
     """
     Test that the datastore correctly handles values of various sizes.
@@ -178,24 +190,32 @@ def test_large_value(datastore_instance, label, size):
     retrieved = get_key_url(datastore_instance, key)
     assert retrieved == value
 
-@pytest.mark.parametrize("label,num_keys", [
-    ("num_keys_100", 100),
-    ("num_keys_1500", 1500),  # Exceeds default in-memory threshold to force disk flush
-])
-def test_many_keys(datastore_instance, label, num_keys):
+
+@pytest.mark.parametrize(
+    "num_keys,value_size",
+    [
+        (100, 128),
+        (1500, 128),
+        # ("num_keys_10000_value_4096_bytes", 10000, 4096),
+    ],
+)
+def test_many_keys(datastore_instance, num_keys, value_size):
     """
     Test that a large number of keys can be stored and retrieved correctly.
     """
     stored_values = {}
     for i in range(num_keys):
         key = f"key_{i}"
-        value = os.urandom(128)  # 128 bytes per key
+        value = os.urandom(value_size)
         stored_values[key] = value
         put_key_url(datastore_instance, key, value)
     # Verify all keys.
-    for key, expected in stored_values.items():
+    items = list(stored_values.items())
+    random.shuffle(items)
+    for key, expected in items:
         retrieved = get_key_url(datastore_instance, key)
         assert retrieved == expected
+
 
 def test_update_value(datastore_instance):
     """
@@ -209,6 +229,7 @@ def test_update_value(datastore_instance):
     # Update the key.
     put_key_url(datastore_instance, key, updated_value)
     assert get_key_url(datastore_instance, key) == updated_value
+
 
 def test_sequence_operations(datastore_instance):
     """
@@ -234,11 +255,13 @@ def test_sequence_operations(datastore_instance):
     for key in keys[25:]:
         assert get_key_url(datastore_instance, key) is None
 
+
 def test_delete_nonexistent(datastore_instance):
     """
     Test that attempting to DELETE a non-existent key does not cause an error.
     """
     delete_key_url(datastore_instance, "nonexistent")
+
 
 def test_durability_across_restarts():
     """
@@ -254,7 +277,7 @@ def test_durability_across_restarts():
 
     try:
         # Insert a set of key-value pairs.
-        keys = {f"dur_{i}": os.urandom(64) for i in range(100)}
+        keys = {f"dur_{i}": os.urandom(64) for i in range(2000)}
         for key, value in keys.items():
             put_key_url(service_url, key, value)
         # Allow time for potential disk flush.
@@ -267,7 +290,9 @@ def test_durability_across_restarts():
     proc2 = start_datastore(storage_dir)
     service_url = SERVICE_URL
     try:
-        for key, expected in keys.items():
+        items = list(keys.items())
+        random.shuffle(items)
+        for key, expected in items:
             retrieved = get_key_url(service_url, key)
             assert retrieved == expected
     finally:
@@ -275,10 +300,13 @@ def test_durability_across_restarts():
         proc2.wait(timeout=5)
         shutil.rmtree(storage_dir)
 
+
 # ---------------------------------------------------------------------------
 # Entry point for running tests directly.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
     import pytest
-    sys.exit(pytest.main([__file__, *sys.argv]))
+
+    print("args", sys.argv)
+    sys.exit(pytest.main(sys.argv))

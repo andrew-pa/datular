@@ -21,7 +21,7 @@ use std::{
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-// TODO: resume from write log; merge sstables
+// TODO: merge sstables
 
 fn default_max_in_memory_values() -> usize {
     1024

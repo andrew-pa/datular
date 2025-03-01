@@ -12,18 +12,10 @@ use tokio_stream::wrappers::ReadDirStream;
 use tracing::{trace, warn};
 
 use crate::{
-    Error, IoSnafu, SerializeSnafu,
+    Error, IoSnafu,
     kv::{read_next_key_value, write_key_value},
     sstable::InMemoryTable,
 };
-
-#[derive(Serialize)]
-pub struct LogRecord<'k, 'v> {
-    #[serde(borrow)]
-    pub key: &'k str,
-    #[serde(borrow)]
-    pub value: &'v [u8],
-}
 
 pub struct WriteAheadLog {
     log_dir: PathBuf,

@@ -13,10 +13,37 @@ use tokio_stream::wrappers::ReadDirStream;
 use tracing::{debug, error, info, trace};
 
 use crate::sstable::{InMemoryTable, OnDiskTable};
-use crate::{
-    Error, IoSnafu,
-    wal::{LogRecord, WriteAheadLog},
-};
+use crate::{Error, IoSnafu, wal::WriteAheadLog};
+
+struct TruncatedBytes<'a> {
+    bytes: &'a Bytes,
+    max_len: usize,
+}
+
+impl<'a> TruncatedBytes<'a> {
+    fn new(bytes: &'a Bytes, max_len: usize) -> Self {
+        Self { bytes, max_len }
+    }
+}
+
+impl<'a> std::fmt::Display for TruncatedBytes<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.bytes.len();
+        let truncated = if len > self.max_len {
+            &self.bytes[..self.max_len]
+        } else {
+            &self.bytes[..]
+        };
+
+        write!(f, "{:?}", truncated)?;
+
+        if len > self.max_len {
+            write!(f, " … ({} more)", len - self.max_len)?;
+        }
+
+        Ok(())
+    }
+}
 
 pub struct DataStore {
     sstable_dir: PathBuf,
@@ -59,7 +86,7 @@ impl DataStore {
     pub async fn get(&self, key: &str) -> Result<Bytes, Error> {
         debug!(key, "get");
         if let Some(value) = self.in_memory.read().await.1.get(key) {
-            debug!(?value, "got");
+            debug!(value=%TruncatedBytes::new(value, 32), "got");
             Ok(value.clone())
         } else {
             let tables = self.sstable_index.read().await;
@@ -67,7 +94,7 @@ impl DataStore {
                 let path = self.sstable_dir.join(table_index.to_string());
                 let mut table = OnDiskTable::open(&path).await?;
                 if let Some(v) = table.get(key).await? {
-                    debug!(value=?v, "got value from disk");
+                    debug!(value=%TruncatedBytes::new(&v, 32), "got value from disk");
                     return Ok(v);
                 }
             }
@@ -121,7 +148,7 @@ impl DataStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn put(&self, key: String, value: Bytes) -> Result<(), Error> {
-        debug!(key, ?value, "put");
+        debug!(key, value=%TruncatedBytes::new(&value, 32), "put");
         let mut in_mem = self.in_memory.write().await;
 
         if in_mem.1.needs_flush() {
