@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap, io::SeekFrom, mem::MaybeUninit, path::Path};
+use std::{cmp::Ordering, collections::BTreeMap, io::SeekFrom, path::Path};
 
 use axum::body::Bytes;
 use bytemuck::{Pod, Zeroable};
@@ -7,7 +7,6 @@ use snafu::{ResultExt as _, ensure};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _, BufReader},
-    sync::{Mutex, OnceCell},
 };
 use tracing::{debug, trace};
 
@@ -190,4 +189,11 @@ impl OnDiskTable {
 
         Ok(None)
     }
+}
+
+pub async fn merge(
+    tables: &[OnDiskTable],
+    output: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), Error> {
+    todo!()
 }

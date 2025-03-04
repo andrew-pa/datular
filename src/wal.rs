@@ -9,7 +9,7 @@ use tokio::{
     io::AsyncWriteExt as _,
 };
 use tokio_stream::wrappers::ReadDirStream;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     Error, IoSnafu,
@@ -75,7 +75,7 @@ impl WriteAheadLog {
                     rt.extend_with(table);
                     rt
                 });
-        trace!(current_segment_id, recovered_values = recovered_table.len());
+        debug!(current_segment_id, recovered_values = recovered_table.len());
         let current_segment = open_segment_file(&log_dir, current_segment_id)
             .await
             .whatever_context("open write log file")?;
