@@ -5,12 +5,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Error};
 
 pub async fn write_key_value(
     f: &mut (impl AsyncWrite + Unpin),
-    key: &str,
-    value: &Bytes,
+    key: &[u8],
+    value: &[u8],
 ) -> Result<(), Error> {
     f.write_u32_le(key.len() as u32).await?;
     f.write_u32_le(value.len() as u32).await?;
-    f.write_all(key.as_bytes()).await?;
+    f.write_all(key).await?;
     f.write_all(value).await
 }
 

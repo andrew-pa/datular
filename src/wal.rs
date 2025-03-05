@@ -2,12 +2,8 @@ use std::path::{Path, PathBuf};
 
 use axum::body::Bytes;
 use futures::TryStreamExt as _;
-use serde::Serialize;
 use snafu::{ResultExt as _, Whatever};
-use tokio::{
-    fs::{self, File},
-    io::AsyncWriteExt as _,
-};
+use tokio::fs::{self, File};
 use tokio_stream::wrappers::ReadDirStream;
 use tracing::{debug, trace, warn};
 
@@ -91,7 +87,7 @@ impl WriteAheadLog {
 
     pub async fn log_write(&mut self, key: &str, value: &Bytes) -> Result<(), Error> {
         trace!("writing to log");
-        write_key_value(&mut self.current_segment, key, value)
+        write_key_value(&mut self.current_segment, key.as_bytes(), value)
             .await
             .context(IoSnafu {
                 cause: "write key/value pair to log",

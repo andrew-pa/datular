@@ -27,12 +27,18 @@ fn default_max_in_memory_values() -> usize {
     1024
 }
 
+fn default_num_segments_to_merge() -> usize {
+    4
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub listen_addr: Option<String>,
     pub storage_dir: PathBuf,
     #[serde(default = "default_max_in_memory_values")]
     pub max_in_memory_values: usize,
+    #[serde(default = "default_num_segments_to_merge")]
+    pub num_sstables_to_merge: usize,
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
@@ -44,7 +50,7 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
 #[derive(Debug, Snafu)]
 pub enum Error {
     Serialize {
-        source: postcard::Error,
+        source: bincode::Error,
     },
     Io {
         cause: String,
@@ -102,11 +108,9 @@ async fn main() -> Result<(), Whatever> {
     tracing_subscriber::fmt::init();
     info!("Hello, world!");
 
-    let data_store = Arc::new(
-        DataStore::new(&CONFIG.storage_dir)
-            .await
-            .whatever_context("initalize data store")?,
-    );
+    let data_store = DataStore::new(&CONFIG.storage_dir)
+        .await
+        .whatever_context("initalize data store")?;
 
     let app = Router::new()
         .route("/health", get(|| async { StatusCode::OK }))

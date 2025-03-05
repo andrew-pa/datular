@@ -1,6 +1,11 @@
-use std::{cmp::Ordering, collections::BTreeMap, io::SeekFrom, path::Path};
+mod merge;
+
+use std::{
+    cmp::Ordering, collections::BTreeMap, fmt::Debug, io::SeekFrom, path::Path, sync::LazyLock,
+};
 
 use axum::body::Bytes;
+use bincode::Options;
 use bytemuck::{Pod, Zeroable};
 use fastbloom::BloomFilter;
 use snafu::{ResultExt as _, ensure};
@@ -21,6 +26,13 @@ struct FileHeader {
     key_filter_len: u32,
     num_values: u64,
 }
+
+const BINCODE: LazyLock<
+    bincode::config::WithOtherIntEncoding<
+        bincode::config::DefaultOptions,
+        bincode::config::FixintEncoding,
+    >,
+> = LazyLock::new(|| bincode::options().with_fixint_encoding());
 
 pub struct InMemoryTable {
     key_filter: BloomFilter,
@@ -68,7 +80,9 @@ impl InMemoryTable {
         // bloom filter
         // sequence of: key len; value len; key bytes; value bytes
 
-        let filter_ser = postcard::to_allocvec(&self.key_filter).context(SerializeSnafu)?;
+        let filter_ser = BINCODE
+            .serialize(&self.key_filter)
+            .context(SerializeSnafu)?;
 
         let header = FileHeader {
             version: 0,
@@ -86,9 +100,11 @@ impl InMemoryTable {
         })?;
 
         for (key, value) in self.data.iter() {
-            write_key_value(f, key, value).await.context(IoSnafu {
-                cause: "write key/value pair",
-            })?;
+            write_key_value(f, key.as_bytes(), value)
+                .await
+                .context(IoSnafu {
+                    cause: "write key/value pair",
+                })?;
         }
 
         f.flush().await.context(IoSnafu {
@@ -120,6 +136,30 @@ impl OnDiskTable {
         Ok(Self { file, header })
     }
 
+    async fn skip_to_data(&mut self) -> Result<(), Error> {
+        self.file
+            .seek(SeekFrom::Start(
+                size_of::<FileHeader>() as u64 + self.header.key_filter_len as u64,
+            ))
+            .await
+            .context(IoSnafu {
+                cause: "seek to key filter",
+            })
+            .map(|_| ())
+    }
+
+    async fn read_next_key(&mut self) -> Result<(u32, Vec<u8>), tokio::io::Error> {
+        // read the lengths of the key and value
+        let key_len = self.file.read_u32_le().await?;
+        let val_len = self.file.read_u32_le().await?;
+
+        // read the full key
+        let mut key_buf = vec![0u8; key_len as usize];
+        self.file.read_exact(&mut key_buf).await?;
+
+        Ok((val_len, key_buf))
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn get(&mut self, key: &str) -> Result<Option<Bytes>, Error> {
         self.file
@@ -132,7 +172,7 @@ impl OnDiskTable {
         self.file.read_exact(&mut buf).await.context(IoSnafu {
             cause: "read key filter",
         })?;
-        let key_filter: BloomFilter = postcard::from_bytes(&buf).context(SerializeSnafu)?;
+        let key_filter: BloomFilter = BINCODE.deserialize(&buf).context(SerializeSnafu)?;
         trace!("checking key filter for key");
         if !key_filter.contains(key) {
             return Ok(None);
@@ -140,20 +180,9 @@ impl OnDiskTable {
 
         trace!("scanning for value");
         for _ in 0..self.header.num_values {
-            // read the lengths of the key and value
-            let key_len = self.file.read_u32_le().await.context(IoSnafu {
-                cause: "read key len",
+            let (val_len, key_buf) = self.read_next_key().await.context(IoSnafu {
+                cause: "read next key",
             })?;
-            let val_len = self.file.read_u32_le().await.context(IoSnafu {
-                cause: "read value len",
-            })?;
-
-            // read the full key
-            let mut key_buf = vec![0u8; key_len as usize];
-            self.file
-                .read_exact(&mut key_buf)
-                .await
-                .context(IoSnafu { cause: "read key" })?;
 
             // compare the key to the one we are looking for
             match key_buf.as_slice().cmp(key.as_bytes()) {
@@ -189,11 +218,4 @@ impl OnDiskTable {
 
         Ok(None)
     }
-}
-
-pub async fn merge(
-    tables: &[OnDiskTable],
-    output: &mut (impl AsyncWrite + Unpin),
-) -> Result<(), Error> {
-    todo!()
 }

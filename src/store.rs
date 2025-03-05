@@ -1,22 +1,29 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::FileType,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use axum::body::Bytes;
 use futures::TryStreamExt;
 use snafu::{ResultExt, Whatever};
 use tokio::{
-    fs::{self, File},
+    fs::{self, DirEntry, File},
     io::BufWriter,
-    sync::{RwLock, RwLockWriteGuard},
+    sync::{
+        OnceCell, RwLock, RwLockWriteGuard,
+        mpsc::{Receiver, Sender, channel},
+    },
+    task::JoinHandle,
 };
 
 use tokio_stream::wrappers::ReadDirStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
-use crate::sstable::{InMemoryTable, OnDiskTable};
+use crate::{
+    CONFIG,
+    sstable::{InMemoryTable, OnDiskTable},
+};
 use crate::{Error, IoSnafu, wal::WriteAheadLog};
 
 struct TruncatedBytes<'a> {
@@ -53,6 +60,12 @@ pub struct DataStore {
     sstable_dir: PathBuf,
     sstable_index: RwLock<BTreeMap<usize, BTreeSet<usize>>>,
     in_memory: RwLock<(WriteAheadLog, InMemoryTable)>,
+    merge_queue: Sender<usize>,
+    merge_worker: OnceCell<JoinHandle<()>>,
+}
+
+fn dir_entry_to_index(e: &DirEntry) -> Option<usize> {
+    e.file_name().to_string_lossy().parse::<usize>().ok()
 }
 
 impl DataStore {
@@ -62,7 +75,7 @@ impl DataStore {
         // enter each subdirectory representing a level
         ReadDirStream::new(fs::read_dir(&sst_path).await?).try_filter_map(async |e| {
             let ty = e.file_type().await?;
-            if let Some(lvl) = ty.is_dir().then(|| e.file_name().to_string_lossy().parse::<usize>().ok()).flatten() {
+            if let Some(lvl) = ty.is_dir().then(|| dir_entry_to_index(&e)).flatten() {
                 fs::read_dir(e.path())
                     .await
                     .map(move |s| Some(ReadDirStream::new(s).map_ok(move |e| (lvl, e))))
@@ -76,7 +89,7 @@ impl DataStore {
         .try_filter_map(async |(lvl, e)| {
             let ty = e.file_type().await?;
             Ok(
-                ty.is_file().then(|| e.file_name().to_string_lossy().parse::<usize>().ok()).flatten()
+                ty.is_file().then(|| dir_entry_to_index(&e)).flatten()
                 .map(|i| (lvl, i))
             )
         })
@@ -90,7 +103,127 @@ impl DataStore {
         .await
     }
 
-    pub async fn new(data_path: &Path) -> Result<Self, Whatever> {
+    async fn process_merge_task(&self, level: usize) -> Result<(), Error> {
+        info!("performing SSTable merge");
+        // TODO: if we're at the maximum level?
+        let next_level = level + 1;
+
+        // open tables
+        let s = fs::read_dir(self.sstable_dir.join(level.to_string()))
+            .await
+            .context(IoSnafu {
+                cause: "read sstable dir for level",
+            })?;
+        let mut table_paths: Vec<_> = ReadDirStream::new(s)
+            .try_filter_map(async |e| {
+                let ty = e.file_type().await?;
+                Ok(ty
+                    .is_file()
+                    .then(|| dir_entry_to_index(&e))
+                    .flatten()
+                    .map(|i| (i, e.path())))
+            })
+            .try_collect()
+            .await
+            .context(IoSnafu {
+                cause: "scan sstable dir for level",
+            })?;
+
+        trace!(?table_paths, "tables at level");
+
+        if table_paths.len() < CONFIG.num_sstables_to_merge {
+            debug!(
+                num_tables = table_paths.len(),
+                "skipping merge, not enough SSTables at level"
+            );
+            return Ok(());
+        }
+
+        table_paths.sort_by_key(|(i, _)| std::cmp::Reverse(*i));
+
+        let next_index = table_paths.first().unwrap().0;
+
+        let mut tables = Vec::new();
+        for (_, path) in table_paths.iter().take(CONFIG.num_sstables_to_merge) {
+            tables.push(OnDiskTable::open(path).await?);
+        }
+
+        // output destination file
+        trace!("creating output for merge");
+        fs::create_dir_all(self.sstable_dir.join(next_level.to_string()))
+            .await
+            .context(IoSnafu {
+                cause: "ensure sstable directory level exists",
+            })?;
+        let output_tmp_name = self.sstable_dir.join(format!("{next_level}/__"));
+        let mut output = File::create(&output_tmp_name).await.context(IoSnafu {
+            cause: "create sstable merge output file",
+        })?;
+
+        OnDiskTable::merge(&mut tables, &mut output).await?;
+
+        output.sync_data().await.context(IoSnafu {
+            cause: "sync new sstable",
+        })?;
+
+        // rename destination file to cause it to become visible
+        trace!(
+            lvl = next_level,
+            idx = next_index,
+            "making merged SSTable visible"
+        );
+        fs::rename(output_tmp_name, self.table_path(next_level, next_index))
+            .await
+            .context(IoSnafu {
+                cause: "failed to rename merge output",
+            })?;
+
+        // update the sstable index
+        trace!("updating in-memory SSTable index");
+        {
+            let mut index = self.sstable_index.write().await;
+            index.entry(next_level).or_default().insert(next_index);
+            let lvl_index = index.get_mut(&level).expect("index has set for level");
+            for (i, _) in table_paths.iter().take(CONFIG.num_sstables_to_merge) {
+                lvl_index.remove(i);
+            }
+        }
+
+        // delete old sstables
+        trace!("deleting old SSTables on disk");
+        drop(tables);
+        for (_, p) in table_paths.iter().take(CONFIG.num_sstables_to_merge) {
+            fs::remove_file(p).await.context(IoSnafu {
+                cause: "delete old sstable ",
+            })?;
+        }
+
+        Ok(())
+    }
+
+    async fn merge_worker(self: Arc<Self>, mut merge_queue: Receiver<usize>) {
+        trace!("starting merge worker");
+        while let Some(level) = merge_queue.recv().await {
+            let span = tracing::info_span!("merge", level);
+            match self
+                .process_merge_task(level)
+                .instrument(span.clone())
+                .await
+            {
+                Ok(()) => {
+                    let _enter = span.enter();
+                    debug!("merge successful!")
+                }
+                Err(e) => {
+                    let _enter = span.enter();
+                    error!("merge failed: {}", snafu::Report::from_error(e));
+                    panic!()
+                }
+            }
+        }
+    }
+
+    pub async fn new(data_path: &Path) -> Result<Arc<Self>, Whatever> {
         let log_path = data_path.join("log");
         let sst_path = data_path.join("data");
         info!(log_path=%log_path.display(), data_path=%sst_path.display(), "initializing data store");
@@ -112,11 +245,24 @@ impl DataStore {
 
         debug!(index=?tables, "initial SSTable index");
 
-        Ok(Self {
+        let (merge_queue, merge_queue_recv) = channel(256);
+
+        let this = Arc::new(Self {
             sstable_dir: sst_path,
             sstable_index: RwLock::new(tables),
             in_memory: RwLock::new(write_log_and_init_recovered_table),
-        })
+            merge_queue,
+            merge_worker: OnceCell::new(),
+        });
+
+        this.merge_worker
+            .set(tokio::spawn(Self::merge_worker(
+                this.clone(),
+                merge_queue_recv,
+            )))
+            .expect("store merge worker join handle");
+
+        Ok(this)
     }
 
     fn table_path(&self, level: usize, index: usize) -> PathBuf {
@@ -177,13 +323,19 @@ impl DataStore {
             }
         }
 
-        self.sstable_index
-            .write()
-            .await
-            .first_entry()
-            .expect("at least one level present in SSTable index")
-            .get_mut()
-            .insert(old_log_segment_id);
+        {
+            let mut ssi = self.sstable_index.write().await;
+            let mut level = ssi
+                .first_entry()
+                .expect("at least one level present in SSTable index");
+            level.get_mut().insert(old_log_segment_id);
+            if level.get().len() >= CONFIG.num_sstables_to_merge {
+                self.merge_queue
+                    .send(*level.key())
+                    .await
+                    .expect("send merge request");
+            }
+        }
 
         match in_mem.0.delete_old_segment(old_log_segment_id).await {
             Ok(()) => {}
