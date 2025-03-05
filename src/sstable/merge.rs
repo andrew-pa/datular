@@ -150,6 +150,7 @@ impl OnDiskTable {
             .serialized_size(&key_filter)
             .context(SerializeSnafu)?;
 
+        // we're going to come back and write the header at the end
         output
             .seek(SeekFrom::Start(filter_len + size_of::<FileHeader>() as u64))
             .await
@@ -157,7 +158,7 @@ impl OnDiskTable {
                 cause: "seek past header",
             })?;
 
-        trace!("seeking to start of data at each table");
+        trace!("seeking to start of data at each input table");
         for table in tables.iter_mut() {
             table.skip_to_data().await?;
         }
@@ -173,7 +174,6 @@ impl OnDiskTable {
             })
             .collect::<Vec<_>>();
         while !cursors.iter().all(Cursor::finished) {
-            trace!("fetching new keys");
             // fetch new keys
             for cursor in cursors.iter_mut() {
                 cursor.fetch_step().await?;
@@ -182,7 +182,7 @@ impl OnDiskTable {
             // pick the smallest key, then pick the newest data
             let next = cursors.iter_mut().min_by(|a, b| a.key_order(b)).unwrap();
             // write the smallest key/value to the output and move to the next pair for all matching tables
-            trace!(?next, "selected next cursor");
+            trace!(table = next.table_index, "selected next cursor");
             match next.consume_pending_key_value_pair().await? {
                 Some((key, val)) => {
                     num_values += 1;
@@ -204,25 +204,7 @@ impl OnDiskTable {
             cause: "rewind to start of merge output",
         })?;
 
-        let filter_ser = BINCODE.serialize(&key_filter).context(SerializeSnafu)?;
-
-        let header = FileHeader {
-            version: 0,
-            num_values,
-            key_filter_len: filter_ser.len() as u32,
-        };
-
-        trace!(?header, "writing SSTable header");
-
-        output
-            .write_all(bytemuck::bytes_of(&header))
-            .await
-            .context(IoSnafu {
-                cause: "write SSTable header",
-            })?;
-        output.write_all(&filter_ser).await.context(IoSnafu {
-            cause: "write bloom filter for keys",
-        })?;
+        write_header(output, num_values, &key_filter).await?;
 
         output.flush().await.context(IoSnafu {
             cause: "flush merged SSTable",

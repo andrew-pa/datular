@@ -27,7 +27,7 @@ fn default_max_in_memory_values() -> usize {
     1024
 }
 
-fn default_num_segments_to_merge() -> usize {
+fn default_num_sstables_to_merge() -> usize {
     4
 }
 
@@ -37,7 +37,7 @@ pub struct Config {
     pub storage_dir: PathBuf,
     #[serde(default = "default_max_in_memory_values")]
     pub max_in_memory_values: usize,
-    #[serde(default = "default_num_segments_to_merge")]
+    #[serde(default = "default_num_sstables_to_merge")]
     pub num_sstables_to_merge: usize,
 }
 

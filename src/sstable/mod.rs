@@ -49,6 +49,33 @@ impl Default for InMemoryTable {
     }
 }
 
+async fn write_header(
+    f: &mut (impl AsyncWrite + Unpin),
+    num_values: u64,
+    key_filter: &BloomFilter,
+) -> Result<(), Error> {
+    let filter_ser = BINCODE.serialize(&key_filter).context(SerializeSnafu)?;
+
+    let header = FileHeader {
+        version: 0,
+        num_values,
+        key_filter_len: filter_ser.len() as u32,
+    };
+
+    trace!(?header, "writing SSTable header");
+
+    f.write_all(bytemuck::bytes_of(&header))
+        .await
+        .context(IoSnafu {
+            cause: "write SSTable header",
+        })?;
+    f.write_all(&filter_ser).await.context(IoSnafu {
+        cause: "write bloom filter for keys",
+    })?;
+
+    Ok(())
+}
+
 impl InMemoryTable {
     pub fn get(&self, key: &str) -> Option<&Bytes> {
         self.data.get(key).filter(|v| !v.is_empty())
@@ -80,24 +107,7 @@ impl InMemoryTable {
         // bloom filter
         // sequence of: key len; value len; key bytes; value bytes
 
-        let filter_ser = BINCODE
-            .serialize(&self.key_filter)
-            .context(SerializeSnafu)?;
-
-        let header = FileHeader {
-            version: 0,
-            num_values: self.data.len() as u64,
-            key_filter_len: filter_ser.len() as u32,
-        };
-
-        f.write_all(bytemuck::bytes_of(&header))
-            .await
-            .context(IoSnafu {
-                cause: "write SSTable header",
-            })?;
-        f.write_all(&filter_ser).await.context(IoSnafu {
-            cause: "write bloom filter for keys",
-        })?;
+        write_header(f, self.data.len() as u64, &self.key_filter).await?;
 
         for (key, value) in self.data.iter() {
             write_key_value(f, key.as_bytes(), value)
