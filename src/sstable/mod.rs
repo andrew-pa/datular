@@ -82,7 +82,7 @@ impl InMemoryTable {
     }
 
     pub fn insert(&mut self, key: String, value: Bytes) {
-        self.key_filter.insert(&key);
+        self.key_filter.insert(key.as_bytes());
         self.data.insert(key, value);
     }
 
@@ -96,7 +96,7 @@ impl InMemoryTable {
 
     pub fn extend_with(&mut self, items: Vec<(String, Bytes)>) {
         for (k, _) in items.iter() {
-            self.key_filter.insert(k);
+            self.key_filter.insert(k.as_bytes());
         }
         self.data.extend(items);
     }
@@ -184,7 +184,7 @@ impl OnDiskTable {
         })?;
         let key_filter: BloomFilter = BINCODE.deserialize(&buf).context(SerializeSnafu)?;
         trace!("checking key filter for key");
-        if !key_filter.contains(key) {
+        if !key_filter.contains(key.as_bytes()) {
             return Ok(None);
         }
 

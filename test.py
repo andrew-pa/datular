@@ -70,14 +70,13 @@ def start_datastore(storage_dir, additional_env=None):
     proc = subprocess.Popen(
         [exe_path],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
     )
 
     # Wait for the service to be up
+    service_url = "http://" + env.get("DAT_LISTEN_ADDR", "localhost:3333")
     for _ in range(10):
         try:
-            r = requests.get(f"{SERVICE_URL}/health", timeout=1)
+            r = requests.get(f"{service_url}/health", timeout=1)
             r.raise_for_status()
             if r.status_code == 200:
                 break
@@ -85,7 +84,8 @@ def start_datastore(storage_dir, additional_env=None):
             time.sleep(0.5)
     else:
         proc.kill()
-        pytest.skip("Datastore service did not start in time")
+        print("service never started")
+        assert False
     return proc
 
 
@@ -261,6 +261,41 @@ def test_delete_nonexistent(datastore_instance):
     Test that attempting to DELETE a non-existent key does not cause an error.
     """
     delete_key_url(datastore_instance, "nonexistent")
+
+@pytest.mark.parametrize(
+    "max_in_memory_values,num_sstables_to_merge,levels",
+    [
+        (64, 2, 1),
+        (32, 4, 1),
+        (8, 8, 1),
+        (32, 4, 2),
+        (8, 8, 2),
+        (8, 8, 3),
+    ],
+)
+def test_merge(max_in_memory_values, num_sstables_to_merge, levels):
+    storage_dir = tempfile.mkdtemp(prefix="datastore_", dir="/tmp")
+    port = max_in_memory_values+num_sstables_to_merge+levels+random.randint(1025, 34000)
+    service_url = f"http://localhost:{port}"
+    proc = start_datastore(storage_dir, additional_env={
+        "DAT_LISTEN_ADDR": f"127.0.0.1:{port}",
+        "DAT_MAX_IN_MEMORY_VALUES": str(max_in_memory_values),
+        "DAT_NUM_SSTABLES_TO_MERGE": str(num_sstables_to_merge)
+    })
+
+    value = os.urandom(64)
+    keys = list(range(0,max_in_memory_values*num_sstables_to_merge**levels+3))
+    for i in keys:
+        put_key_url(service_url, str(i), value+str(i).encode())
+
+    time.sleep(0.5)
+
+    random.shuffle(keys)
+    for i in keys:
+        v = get_key_url(service_url, str(i))
+        assert v == value+str(i).encode()
+
+    proc.terminate()
 
 
 def test_durability_across_restarts():

@@ -37,7 +37,7 @@ impl<'a> TruncatedBytes<'a> {
     }
 }
 
-impl<'a> std::fmt::Display for TruncatedBytes<'a> {
+impl std::fmt::Display for TruncatedBytes<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let len = self.bytes.len();
         let truncated = if len > self.max_len {

@@ -17,7 +17,7 @@ impl Debug for CursorState {
             Self::Pending { val_len, key } => f
                 .debug_struct("Pending")
                 .field("val_len", val_len)
-                .field("key", &String::from_utf8_lossy(&key))
+                .field("key", &String::from_utf8_lossy(key))
                 .finish(),
             Self::Finished => write!(f, "Finished"),
         }
@@ -39,32 +39,29 @@ impl Debug for Cursor<'_> {
     }
 }
 
-impl<'t> Cursor<'t> {
+impl Cursor<'_> {
     /// If the cursor is in the `ReadNext` state, then read the next key in the file and transition
     /// to the `Pending` state. If EOF is encountered, then the cursor moves to the `Finished`
     /// state.
     async fn fetch_step(&mut self) -> Result<(), Error> {
-        match self.state {
-            CursorState::ReadNext => {
-                self.state = loop {
-                    match self.table.read_next_key().await {
-                        // skip deleted keys. we don't need to seek because the next kv
-                        // pair follows immediatly (since the value is of length zero)
-                        Ok((0, _)) => continue,
-                        Ok((val_len, key)) => break CursorState::Pending { val_len, key },
-                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                            break CursorState::Finished;
-                        }
-                        Err(e) => {
-                            return Err(Error::Io {
-                                cause: "read next key".into(),
-                                source: e,
-                            });
-                        }
+        if let CursorState::ReadNext = self.state {
+            self.state = loop {
+                match self.table.read_next_key().await {
+                    // skip deleted keys. we don't need to seek because the next kv
+                    // pair follows immediatly (since the value is of length zero)
+                    Ok((0, _)) => continue,
+                    Ok((val_len, key)) => break CursorState::Pending { val_len, key },
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        break CursorState::Finished;
+                    }
+                    Err(e) => {
+                        return Err(Error::Io {
+                            cause: "read next key".into(),
+                            source: e,
+                        });
                     }
                 }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -79,7 +76,7 @@ impl<'t> Cursor<'t> {
     fn key_order(&self, other: &Cursor<'_>) -> Ordering {
         match (&self.state, &other.state) {
             (CursorState::Pending { key: key1, .. }, CursorState::Pending { key: key2, .. }) => {
-                key1.cmp(&key2)
+                key1.cmp(key2)
                     .then(self.table_index.cmp(&other.table_index).reverse())
             }
             (CursorState::Finished, _) => Ordering::Greater,
@@ -186,7 +183,7 @@ impl OnDiskTable {
             match next.consume_pending_key_value_pair().await? {
                 Some((key, val)) => {
                     num_values += 1;
-                    key_filter.insert(&key);
+                    key_filter.insert(key.as_slice());
                     write_key_value(output, &key, &val).await.context(IoSnafu {
                         cause: "write value",
                     })?;

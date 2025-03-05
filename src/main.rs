@@ -13,7 +13,7 @@ use axum::{
     routing::{MethodRouter, get},
 };
 use serde::Deserialize;
-use snafu::{ResultExt, Snafu, Whatever, ensure};
+use snafu::{ResultExt, Snafu, Whatever, ensure, ensure_whatever};
 use std::{
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -108,6 +108,15 @@ async fn main() -> Result<(), Whatever> {
     tracing_subscriber::fmt::init();
     info!("Hello, world!");
 
+    ensure_whatever!(
+        CONFIG.max_in_memory_values > 0,
+        "Max in-memory values must be more than zero"
+    );
+    ensure_whatever!(
+        CONFIG.num_sstables_to_merge > 1,
+        "Number of SSTables to merge must be more than one"
+    );
+
     let data_store = DataStore::new(&CONFIG.storage_dir)
         .await
         .whatever_context("initalize data store")?;
@@ -121,7 +130,7 @@ async fn main() -> Result<(), Whatever> {
     let addr = CONFIG.listen_addr.as_deref().unwrap_or("0.0.0.0:3333");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .whatever_context("create TCP listener")?;
+        .with_whatever_context(|_| format!("create TCP listener for address {addr}"))?;
 
     info!(listening_on = addr);
     axum::serve(listener, app)
