@@ -21,10 +21,15 @@ use std::{
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-// TODO: merge sstables
+// TODO: sstable index could be its own thing
 
 fn default_max_in_memory_values() -> usize {
     1024
+}
+
+fn default_max_in_memory_bytes() -> usize {
+    // 16 MiB
+    16 * 1024 * 1024
 }
 
 fn default_num_sstables_to_merge() -> usize {
@@ -33,10 +38,17 @@ fn default_num_sstables_to_merge() -> usize {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// The address that the HTTP server will listen on.
     pub listen_addr: Option<String>,
+    /// The directory to write stored data to.
     pub storage_dir: PathBuf,
+    /// The maximum number of key-value pairs to be held in memory before flushing.
     #[serde(default = "default_max_in_memory_values")]
     pub max_in_memory_values: usize,
+    /// The maximum number of bytes worth of key-value pairs to be held in memory before flushing.
+    #[serde(default = "default_max_in_memory_bytes")]
+    pub max_in_memory_bytes: usize,
+    /// The number of SSTables to merge together in one merge operation, moving them to the next level.
     #[serde(default = "default_num_sstables_to_merge")]
     pub num_sstables_to_merge: usize,
 }
@@ -52,6 +64,7 @@ pub enum Error {
     Serialize {
         source: bincode::Error,
     },
+    #[snafu(display("I/O error: {cause}"))]
     Io {
         cause: String,
         source: tokio::io::Error,
@@ -59,6 +72,8 @@ pub enum Error {
     NotFound,
     InvalidValue,
     FileFormatVersion,
+    #[snafu(display("Retried too many times: {cause}"))]
+    TooManyRetries { cause: String }
 }
 
 impl IntoResponse for Error {

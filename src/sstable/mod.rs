@@ -1,7 +1,7 @@
 mod merge;
 
 use std::{
-    cmp::Ordering, collections::BTreeMap, fmt::Debug, io::SeekFrom, path::Path, sync::LazyLock,
+    cmp::Ordering, collections::BTreeMap, fmt::Debug, io::{ErrorKind, SeekFrom}, path::Path, sync::LazyLock, time::Duration,
 };
 
 use axum::body::Bytes;
@@ -13,11 +13,11 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _, BufReader},
 };
-use tracing::{debug, trace};
+use tracing::{debug, error, trace, warn};
 
 use crate::{CONFIG, Error, FileFormatVersionSnafu, IoSnafu, SerializeSnafu, kv::write_key_value};
 
-pub const BLOOM_FILTER_FALSE_POSITIVE_RATE: f64 = 0.01;
+pub const BLOOM_FILTER_FALSE_POSITIVE_RATE: f64 = 0.3;
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -37,6 +37,7 @@ const BINCODE: LazyLock<
 pub struct InMemoryTable {
     key_filter: BloomFilter,
     data: BTreeMap<String, Bytes>,
+    data_size_in_bytes: usize
 }
 
 impl Default for InMemoryTable {
@@ -45,6 +46,7 @@ impl Default for InMemoryTable {
             key_filter: BloomFilter::with_false_pos(BLOOM_FILTER_FALSE_POSITIVE_RATE)
                 .expected_items(CONFIG.max_in_memory_values),
             data: BTreeMap::default(),
+            data_size_in_bytes: 0
         }
     }
 }
@@ -82,6 +84,7 @@ impl InMemoryTable {
     }
 
     pub fn insert(&mut self, key: String, value: Bytes) {
+        self.data_size_in_bytes += key.len() + value.len();
         self.key_filter.insert(key.as_bytes());
         self.data.insert(key, value);
     }
@@ -91,11 +94,12 @@ impl InMemoryTable {
     }
 
     pub fn needs_flush(&self) -> bool {
-        self.data.len() >= CONFIG.max_in_memory_values
+        self.data.len() >= CONFIG.max_in_memory_values || self.data_size_in_bytes >= CONFIG.max_in_memory_bytes
     }
 
     pub fn extend_with(&mut self, items: Vec<(String, Bytes)>) {
-        for (k, _) in items.iter() {
+        for (k, v) in items.iter() {
+            self.data_size_in_bytes += k.len() + v.len();
             self.key_filter.insert(k.as_bytes());
         }
         self.data.extend(items);
@@ -130,11 +134,31 @@ pub struct OnDiskTable {
     header: FileHeader,
 }
 
+const MAX_OPEN_RETRIES: usize = 12;
+
 impl OnDiskTable {
     pub async fn open(path: &Path) -> Result<Self, Error> {
-        let mut file = BufReader::new(File::open(path).await.context(IoSnafu {
-            cause: "open sstable on disk",
-        })?);
+        let mut retries = 0;
+        let mut retry_wait = Duration::from_millis(8);
+        let f = loop {
+            if retries > MAX_OPEN_RETRIES { return Err(Error::TooManyRetries { cause: format!("opening SSTable at {}", path.display()) }) }
+            match File::open(path).await {
+                Ok(f) => break f,
+                // retry if an unusual error occurred (i.e. we run out of handles)
+                Err(e) => match e.kind() {
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput => {
+                        return Err(Error::Io { cause: "open sstable on disk".into(), source: e })
+                    }
+                    _ => {
+                        warn!(path=?path.display(), error=?e, "unusual error occurred, retrying after {retry_wait:?}");
+                        retries += 1;
+                        tokio::time::sleep(retry_wait).await;
+                        retry_wait = retry_wait * 2;
+                    }
+                }
+            }
+        };
+        let mut file = BufReader::new(f);
         let mut header = FileHeader::zeroed();
         file.read_exact(bytemuck::bytes_of_mut(&mut header))
             .await

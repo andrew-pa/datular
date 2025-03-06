@@ -60,6 +60,7 @@ pub struct DataStore {
     sstable_dir: PathBuf,
     sstable_index: RwLock<BTreeMap<usize, BTreeSet<usize>>>,
     in_memory: RwLock<(WriteAheadLog, InMemoryTable)>,
+    pending_flush: RwLock<Option<InMemoryTable>>,
     merge_queue: Sender<usize>,
     merge_worker: OnceCell<JoinHandle<()>>,
 }
@@ -182,7 +183,11 @@ impl DataStore {
         trace!("updating in-memory SSTable index");
         {
             let mut index = self.sstable_index.write().await;
-            index.entry(next_level).or_default().insert(next_index);
+            let nl = index.entry(next_level).or_default();
+            nl.insert(next_index);
+            if nl.len() > CONFIG.num_sstables_to_merge {
+                self.merge_queue.send(next_level).await.expect("send merge request");
+            }
             let lvl_index = index.get_mut(&level).expect("index has set for level");
             for (i, _) in table_paths.iter().take(CONFIG.num_sstables_to_merge) {
                 lvl_index.remove(i);
@@ -251,6 +256,7 @@ impl DataStore {
             sstable_dir: sst_path,
             sstable_index: RwLock::new(tables),
             in_memory: RwLock::new(write_log_and_init_recovered_table),
+            pending_flush: RwLock::default(),
             merge_queue,
             merge_worker: OnceCell::new(),
         });
@@ -275,6 +281,9 @@ impl DataStore {
         if let Some(value) = self.in_memory.read().await.1.get(key) {
             debug!(value=%TruncatedBytes::new(value, 32), "got value from memory");
             Ok(value.clone())
+        } else if let Some(value) = self.pending_flush.read().await.as_ref().and_then(|t| t.get(key)) {
+            debug!(value=%TruncatedBytes::new(value, 32), "got value from memory (pending flush)");
+            Ok(value.clone())
         } else {
             let tables = self.sstable_index.read().await;
             for path in tables.iter().flat_map(|(&lvl, v)| {
@@ -293,33 +302,37 @@ impl DataStore {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     async fn flush_in_memory(
-        &self,
-        in_mem: &mut RwLockWriteGuard<'_, (WriteAheadLog, InMemoryTable)>,
-    ) -> Result<(), Error> {
-        let old_log_segment_id = in_mem.0.rotate_log().await?;
+        self: Arc<Self>,
+        old_log_segment_id: usize,
+    ) {
         debug!(segment_id = old_log_segment_id, "flushing in-memory store");
-
-        let data = core::mem::take(&mut in_mem.1);
 
         let path = self.table_path(0, old_log_segment_id);
 
-        trace!(path=%path.display(), "creating new SSTable file");
-        let mut f = BufWriter::new(File::create_new(path).await.context(IoSnafu {
-            cause: "create SSTable file",
-        })?);
+        {
+            trace!(path=%path.display(), "creating new SSTable file");
+            let mut f = BufWriter::new(match File::create_new(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    error!(error=%e, path=%path.display(), "failed to create new SSTable file");
+                    return;
+                }
+            });
 
-        match data.write(&mut f).await {
-            Ok(()) => {
-                drop(f);
-            }
-            Err(e) => {
-                error!(
-                    old_log_segment_id,
-                    "failed to create new SSTable on disk: {}",
-                    snafu::Report::from_error(e)
-                );
-                panic!("what is the right thing to do here?");
+            let pending_flush = self.pending_flush.read().await;
+
+            match pending_flush.as_ref().unwrap().write(&mut f).await {
+                Ok(()) => { }
+                Err(e) => {
+                    error!(
+                        old_log_segment_id,
+                        "failed to create new SSTable on disk: {}",
+                        snafu::Report::from_error(e)
+                    );
+                    panic!("what is the right thing to do here?");
+                }
             }
         }
 
@@ -337,7 +350,10 @@ impl DataStore {
             }
         }
 
-        match in_mem.0.delete_old_segment(old_log_segment_id).await {
+        // drop the old pending table
+        self.pending_flush.write().await.take();
+
+        match self.in_memory.read().await.0.delete_old_segment(old_log_segment_id).await {
             Ok(()) => {}
             Err(e) => error!(
                 old_log_segment_id,
@@ -345,17 +361,23 @@ impl DataStore {
                 snafu::Report::from_error(e)
             ),
         };
-
-        Ok(())
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn put(&self, key: String, value: Bytes) -> Result<(), Error> {
+    pub async fn put(self: &Arc<Self>, key: String, value: Bytes) -> Result<(), Error> {
         debug!(key, value=%TruncatedBytes::new(&value, 32), "put");
         let mut in_mem = self.in_memory.write().await;
 
         if in_mem.1.needs_flush() {
-            self.flush_in_memory(&mut in_mem).await?;
+            let mut pending_flush = self.pending_flush.write().await;
+            if pending_flush.is_none() {
+                // no flush in progress, so we can flush here
+                let old_log_segment_id = in_mem.0.rotate_log().await?;
+                *pending_flush = Some(core::mem::take(&mut in_mem.1));
+                tokio::spawn(Self::flush_in_memory(self.clone(), old_log_segment_id));
+            } else {
+                warn!("in-memory flush required but flushing previous data still in progress, overfilling current in-memory table!");
+            }
         }
 
         in_mem.0.log_write(&key, &value).await?;
